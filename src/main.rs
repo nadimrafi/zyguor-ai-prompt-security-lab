@@ -1,8 +1,11 @@
 mod attack_lab;
+mod audit;
 mod policy;
 
 use attack_lab::{AttackCategory, attack_catalog};
+use audit::{AuditEvent, record};
 use policy::{GatewayAction, action_for_score};
+use uuid::Uuid;
 
 use axum::{
     Json, Router,
@@ -12,17 +15,24 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 #[derive(Deserialize)]
-
 struct AnalyzePromptRequest {
     prompt: String,
 }
 
 #[derive(Serialize)]
-struct AnalyzePromptResponse {
+struct AnalysisResult {
     verdict: &'static str,
     risk_score: u8,
     findings: Vec<String>,
     action: GatewayAction,
+}
+
+#[derive(Serialize)]
+struct AnalyzePromptResponse {
+    request_id: Uuid,
+
+    #[serde(flatten)]
+    analysis: AnalysisResult,
 }
 #[derive(Serialize)]
 struct AttackLabCaseResult {
@@ -53,6 +63,13 @@ fn app() -> Router {
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
+    tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::INFO)
+        .try_init()
+        .map_err(|error| {
+            std::io::Error::other(format!("failed to initialize structured logging: {error}"))
+        })?;
     let app = app();
 
     let listener = TcpListener::bind("127.0.0.1:3000").await?;
@@ -66,7 +83,23 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 async fn analyze_prompt(Json(request): Json<AnalyzePromptRequest>) -> Json<AnalyzePromptResponse> {
-    Json(analyze_text(&request.prompt))
+    let request_id = Uuid::new_v4();
+    let prompt_length = request.prompt.chars().count();
+    let analysis = analyze_text(&request.prompt);
+
+    record(&AuditEvent {
+        request_id,
+        prompt_length,
+        risk_score: analysis.risk_score,
+        verdict: analysis.verdict,
+        action: analysis.action,
+        finding_count: analysis.findings.len(),
+    });
+
+    Json(AnalyzePromptResponse {
+        request_id,
+        analysis,
+    })
 }
 async fn run_attack_lab() -> Json<AttackLabResponse> {
     let results: Vec<AttackLabCaseResult> = attack_catalog()
@@ -92,7 +125,7 @@ async fn run_attack_lab() -> Json<AttackLabResponse> {
         results,
     })
 }
-fn analyze_text(prompt: &str) -> AnalyzePromptResponse {
+fn analyze_text(prompt: &str) -> AnalysisResult {
     let normalized_prompt = prompt.to_lowercase();
 
     let mut risk_score = 0;
@@ -130,7 +163,7 @@ fn analyze_text(prompt: &str) -> AnalyzePromptResponse {
 
     let action = action_for_score(risk_score);
 
-    AnalyzePromptResponse {
+    AnalysisResult {
         verdict,
         risk_score,
         findings,
@@ -141,10 +174,11 @@ fn analyze_text(prompt: &str) -> AnalyzePromptResponse {
 #[cfg(test)]
 mod tests {
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use super::{GatewayAction, analyze_text, app, attack_catalog};
 
@@ -243,5 +277,30 @@ mod tests {
                 result.risk_score
             );
         }
+    }
+    #[tokio::test]
+    async fn analyze_endpoint_returns_valid_request_id() -> Result<(), Box<dyn std::error::Error>> {
+        let request = Request::post("/analyze-prompt")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"prompt":"Explain secure software development"}"#,
+            ))?;
+
+        let response = app().oneshot(request).await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 4096).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+        let request_id = json["request_id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("response has no request_id"))?;
+
+        Uuid::parse_str(request_id)?;
+
+        assert_eq!(json["action"], "allow");
+
+        Ok(())
     }
 }
