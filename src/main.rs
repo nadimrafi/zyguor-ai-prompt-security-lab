@@ -1,5 +1,9 @@
 mod attack_lab;
+mod policy;
+
 use attack_lab::{AttackCategory, attack_catalog};
+use policy::{GatewayAction, action_for_score};
+
 use axum::{
     Json, Router,
     routing::{get, post},
@@ -8,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 #[derive(Deserialize)]
+
 struct AnalyzePromptRequest {
     prompt: String,
 }
@@ -17,6 +22,7 @@ struct AnalyzePromptResponse {
     verdict: &'static str,
     risk_score: u8,
     findings: Vec<String>,
+    action: GatewayAction,
 }
 #[derive(Serialize)]
 struct AttackLabCaseResult {
@@ -122,10 +128,13 @@ fn analyze_text(prompt: &str) -> AnalyzePromptResponse {
         _ => "high_risk",
     };
 
+    let action = action_for_score(risk_score);
+
     AnalyzePromptResponse {
         verdict,
         risk_score,
         findings,
+        action,
     }
 }
 
@@ -137,7 +146,7 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{analyze_text, app, attack_catalog};
+    use super::{GatewayAction, analyze_text, app, attack_catalog};
 
     #[tokio::test]
     async fn health_endpoint_returns_success() -> Result<(), Box<dyn std::error::Error>> {
@@ -169,6 +178,7 @@ mod tests {
         assert_eq!(result.verdict, "safe");
         assert_eq!(result.risk_score, 0);
         assert!(result.findings.is_empty());
+        assert_eq!(result.action, GatewayAction::Allow);
     }
     #[test]
     fn detects_system_prompt_extraction_attempt() {
@@ -218,6 +228,7 @@ mod tests {
         assert_eq!(result.verdict, "high_risk");
         assert_eq!(result.risk_score, 90);
         assert_eq!(result.findings.len(), 2);
+        assert_eq!(result.action, GatewayAction::Block);
     }
     #[test]
     fn all_attack_catalog_cases_meet_expected_score() {
