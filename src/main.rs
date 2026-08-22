@@ -1,14 +1,19 @@
 mod attack_lab;
 mod audit;
 mod policy;
+mod validation;
 
 use attack_lab::{AttackCategory, attack_catalog};
 use audit::{AuditEvent, record};
 use policy::{GatewayAction, action_for_score};
 use uuid::Uuid;
+use validation::{PromptValidationError, validate_prompt};
 
 use axum::{
     Json, Router,
+    extract::DefaultBodyLimit,
+    extract::rejection::JsonRejection,
+    http::StatusCode,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -35,6 +40,14 @@ struct AnalyzePromptResponse {
     analysis: AnalysisResult,
 }
 #[derive(Serialize)]
+struct ApiErrorResponse {
+    code: &'static str,
+    message: String,
+}
+
+type ApiError = (StatusCode, Json<ApiErrorResponse>);
+
+#[derive(Serialize)]
 struct AttackLabCaseResult {
     name: &'static str,
     category: AttackCategory,
@@ -59,8 +72,8 @@ fn app() -> Router {
         .route("/health", get(health))
         .route("/analyze-prompt", post(analyze_prompt))
         .route("/attack-lab", get(run_attack_lab))
+        .layer(DefaultBodyLimit::max(32 * 1024))
 }
-
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     tracing_subscriber::fmt()
@@ -82,7 +95,13 @@ async fn main() -> Result<(), std::io::Error> {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
-async fn analyze_prompt(Json(request): Json<AnalyzePromptRequest>) -> Json<AnalyzePromptResponse> {
+async fn analyze_prompt(
+    payload: Result<Json<AnalyzePromptRequest>, JsonRejection>,
+) -> Result<Json<AnalyzePromptResponse>, ApiError> {
+    let Json(request) = payload.map_err(json_rejection_response)?;
+
+    validate_prompt(&request.prompt).map_err(validation_error_response)?;
+
     let request_id = Uuid::new_v4();
     let prompt_length = request.prompt.chars().count();
     let analysis = analyze_text(&request.prompt);
@@ -96,10 +115,56 @@ async fn analyze_prompt(Json(request): Json<AnalyzePromptRequest>) -> Json<Analy
         finding_count: analysis.findings.len(),
     });
 
-    Json(AnalyzePromptResponse {
+    Ok(Json(AnalyzePromptResponse {
         request_id,
         analysis,
-    })
+    }))
+}
+
+fn json_rejection_response(rejection: JsonRejection) -> ApiError {
+    let status = rejection.status();
+
+    let (code, message) = match status {
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            "request_body_too_large",
+            "Request body exceeds the allowed size",
+        ),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+            "unsupported_media_type",
+            "Content-Type must be application/json",
+        ),
+        _ => (
+            "invalid_json",
+            "Request body must contain valid JSON with a prompt field",
+        ),
+    };
+
+    (
+        status,
+        Json(ApiErrorResponse {
+            code,
+            message: message.to_string(),
+        }),
+    )
+}
+
+fn validation_error_response(error: PromptValidationError) -> ApiError {
+    match error {
+        PromptValidationError::Empty => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                code: "empty_prompt",
+                message: "Prompt must not be empty".to_string(),
+            }),
+        ),
+        PromptValidationError::TooLong { actual, maximum } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ApiErrorResponse {
+                code: "prompt_too_long",
+                message: format!("Prompt contains {actual} characters; maximum is {maximum}"),
+            }),
+        ),
+    }
 }
 async fn run_attack_lab() -> Json<AttackLabResponse> {
     let results: Vec<AttackLabCaseResult> = attack_catalog()
@@ -278,6 +343,85 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn analyze_endpoint_rejects_empty_prompt_with_typed_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = Request::post("/analyze-prompt")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"prompt":"   "}"#))?;
+
+        let response = app().oneshot(request).await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), 4096).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+        assert_eq!(json["code"], "empty_prompt");
+        assert_eq!(json["message"], "Prompt must not be empty");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_endpoint_rejects_oversized_body() -> Result<(), Box<dyn std::error::Error>> {
+        let oversized_json = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(40 * 1024));
+
+        let request = Request::post("/analyze-prompt")
+            .header("Content-Type", "application/json")
+            .body(Body::from(oversized_json))?;
+
+        let response = app().oneshot(request).await?;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), 4096).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+        assert_eq!(json["code"], "request_body_too_large");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_endpoint_rejects_malformed_json_with_typed_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = Request::post("/analyze-prompt")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"prompt":"unfinished"#))?;
+
+        let response = app().oneshot(request).await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), 4096).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+        assert_eq!(json["code"], "invalid_json");
+        assert_eq!(
+            json["message"],
+            "Request body must contain valid JSON with a prompt field"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_endpoint_requires_json_content_type() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let request = Request::post("/analyze-prompt").body(Body::from(r#"{"prompt":"hello"}"#))?;
+
+        let response = app().oneshot(request).await?;
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let body = to_bytes(response.into_body(), 4096).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+        assert_eq!(json["code"], "unsupported_media_type");
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn analyze_endpoint_returns_valid_request_id() -> Result<(), Box<dyn std::error::Error>> {
         let request = Request::post("/analyze-prompt")
