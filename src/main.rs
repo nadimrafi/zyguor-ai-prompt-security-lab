@@ -1,3 +1,5 @@
+mod attack_lab;
+use attack_lab::{AttackCategory, attack_catalog};
 use axum::{
     Json, Router,
     routing::{get, post},
@@ -16,6 +18,21 @@ struct AnalyzePromptResponse {
     risk_score: u8,
     findings: Vec<String>,
 }
+#[derive(Serialize)]
+struct AttackLabCaseResult {
+    name: &'static str,
+    category: AttackCategory,
+    expected_min_score: u8,
+    actual_score: u8,
+    passed: bool,
+}
+
+#[derive(Serialize)]
+struct AttackLabResponse {
+    total_cases: usize,
+    passed_cases: usize,
+    results: Vec<AttackLabCaseResult>,
+}
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -25,6 +42,7 @@ fn app() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/analyze-prompt", post(analyze_prompt))
+        .route("/attack-lab", get(run_attack_lab))
 }
 
 #[tokio::main]
@@ -44,7 +62,30 @@ async fn health() -> Json<HealthResponse> {
 async fn analyze_prompt(Json(request): Json<AnalyzePromptRequest>) -> Json<AnalyzePromptResponse> {
     Json(analyze_text(&request.prompt))
 }
+async fn run_attack_lab() -> Json<AttackLabResponse> {
+    let results: Vec<AttackLabCaseResult> = attack_catalog()
+        .into_iter()
+        .map(|case| {
+            let analysis = analyze_text(case.payload);
 
+            AttackLabCaseResult {
+                name: case.name,
+                category: case.category,
+                expected_min_score: case.expected_min_score,
+                actual_score: analysis.risk_score,
+                passed: analysis.risk_score >= case.expected_min_score,
+            }
+        })
+        .collect();
+
+    let passed_cases = results.iter().filter(|result| result.passed).count();
+
+    Json(AttackLabResponse {
+        total_cases: results.len(),
+        passed_cases,
+        results,
+    })
+}
 fn analyze_text(prompt: &str) -> AnalyzePromptResponse {
     let normalized_prompt = prompt.to_lowercase();
 
@@ -96,7 +137,7 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{analyze_text, app};
+    use super::{analyze_text, app, attack_catalog};
 
     #[tokio::test]
     async fn health_endpoint_returns_success() -> Result<(), Box<dyn std::error::Error>> {
@@ -177,5 +218,19 @@ mod tests {
         assert_eq!(result.verdict, "high_risk");
         assert_eq!(result.risk_score, 90);
         assert_eq!(result.findings.len(), 2);
+    }
+    #[test]
+    fn all_attack_catalog_cases_meet_expected_score() {
+        for case in attack_catalog() {
+            let result = analyze_text(case.payload);
+
+            assert!(
+                result.risk_score >= case.expected_min_score,
+                "Attack case '{}' expected at least score {}, but received {}",
+                case.name,
+                case.expected_min_score,
+                result.risk_score
+            );
+        }
     }
 }
