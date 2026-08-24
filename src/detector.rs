@@ -2,19 +2,22 @@ use serde::Serialize;
 
 use crate::policy::{GatewayAction, PolicyConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuleId {
-    InstructionOverride,
-    SystemPromptExtraction,
-    SensitiveDataExposure,
-}
+pub use crate::rules::RuleId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SecurityFinding {
     pub rule_id: RuleId,
     pub message: &'static str,
     pub score: u8,
+}
+fn finding_for_rule(rule_id: RuleId) -> SecurityFinding {
+    let metadata = rule_id.metadata();
+
+    SecurityFinding {
+        rule_id,
+        message: metadata.description,
+        score: metadata.score,
+    }
 }
 
 #[derive(Serialize)]
@@ -34,21 +37,13 @@ pub fn analyze_text_with_policy(prompt: &str, policy: PolicyConfig) -> AnalysisR
     let mut findings = Vec::new();
 
     if normalized_prompt.contains("ignore previous instructions") {
-        findings.push(SecurityFinding {
-            rule_id: RuleId::InstructionOverride,
-            message: "Instruction-override phrase detected",
-            score: 40,
-        });
+        findings.push(finding_for_rule(RuleId::InstructionOverride));
     }
 
     if normalized_prompt.contains("system prompt")
         && (normalized_prompt.contains("reveal") || normalized_prompt.contains("show"))
     {
-        findings.push(SecurityFinding {
-            rule_id: RuleId::SystemPromptExtraction,
-            message: "System-prompt extraction attempt detected",
-            score: 50,
-        });
+        findings.push(finding_for_rule(RuleId::SystemPromptExtraction));
     }
 
     let requests_sensitive_data = normalized_prompt.contains("api key")
@@ -60,11 +55,7 @@ pub fn analyze_text_with_policy(prompt: &str, policy: PolicyConfig) -> AnalysisR
         || normalized_prompt.contains("print");
 
     if requests_sensitive_data && requests_exposure {
-        findings.push(SecurityFinding {
-            rule_id: RuleId::SensitiveDataExposure,
-            message: "Sensitive-data exposure attempt detected",
-            score: 35,
-        });
+        findings.push(finding_for_rule(RuleId::SensitiveDataExposure));
     }
 
     let risk_score = findings

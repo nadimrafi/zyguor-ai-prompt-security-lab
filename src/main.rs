@@ -2,6 +2,7 @@ mod attack_lab;
 mod audit;
 mod detector;
 mod policy;
+mod rules;
 mod validation;
 
 use attack_lab::{AttackCategory, attack_catalog};
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
+use rules::{DETECTOR_VERSION, RuleId, RuleMetadata, enabled_rules};
 use validation::{PromptValidationError, validate_prompt};
 
 #[derive(Deserialize)]
@@ -34,6 +36,7 @@ struct AppState {
 #[derive(Serialize)]
 struct AnalyzePromptResponse {
     request_id: Uuid,
+    detector_version: &'static str,
 
     #[serde(flatten)]
     analysis: AnalysisResult,
@@ -42,6 +45,11 @@ struct AnalyzePromptResponse {
 struct ApiErrorResponse {
     code: &'static str,
     message: String,
+}
+#[derive(Serialize)]
+struct DetectorRulesResponse {
+    detector_version: &'static str,
+    enabled_rules: [RuleMetadata; 3],
 }
 
 type ApiError = (StatusCode, Json<ApiErrorResponse>);
@@ -53,6 +61,8 @@ struct AttackLabCaseResult {
     expected_min_score: u8,
     actual_score: u8,
     passed: bool,
+    expected_rule_id: RuleId,
+    rule_detected: bool,
 }
 
 #[derive(Serialize)]
@@ -78,6 +88,7 @@ fn app_with_policy(policy: PolicyConfig) -> Router {
         .route("/health", get(health))
         .route("/analyze-prompt", post(analyze_prompt))
         .route("/attack-lab", get(run_attack_lab))
+        .route("/rules", get(detector_rules))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .with_state(state)
 }
@@ -136,6 +147,14 @@ async fn main() -> Result<(), std::io::Error> {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
+
+async fn detector_rules() -> Json<DetectorRulesResponse> {
+    Json(DetectorRulesResponse {
+        detector_version: DETECTOR_VERSION,
+        enabled_rules: enabled_rules(),
+    })
+}
+
 async fn analyze_prompt(
     State(state): State<AppState>,
     payload: Result<Json<AnalyzePromptRequest>, JsonRejection>,
@@ -159,6 +178,7 @@ async fn analyze_prompt(
 
     Ok(Json(AnalyzePromptResponse {
         request_id,
+        detector_version: DETECTOR_VERSION,
         analysis,
     }))
 }
@@ -213,13 +233,19 @@ async fn run_attack_lab() -> Json<AttackLabResponse> {
         .into_iter()
         .map(|case| {
             let analysis = analyze_text(case.payload);
+            let rule_detected = analysis
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == case.expected_rule_id);
 
             AttackLabCaseResult {
                 name: case.name,
                 category: case.category,
                 expected_min_score: case.expected_min_score,
                 actual_score: analysis.risk_score,
-                passed: analysis.risk_score >= case.expected_min_score,
+                passed: analysis.risk_score >= case.expected_min_score && rule_detected,
+                expected_rule_id: case.expected_rule_id,
+                rule_detected,
             }
         })
         .collect();
@@ -373,6 +399,10 @@ mod tests {
     fn all_attack_catalog_cases_meet_expected_score() {
         for case in attack_catalog() {
             let result = analyze_text(case.payload);
+            let expected_rule_detected = result
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == case.expected_rule_id);
 
             assert!(
                 result.risk_score >= case.expected_min_score,
@@ -381,7 +411,31 @@ mod tests {
                 case.expected_min_score,
                 result.risk_score
             );
+            assert!(
+                expected_rule_detected,
+                "Attack case '{}' expected rule {:?}, but it was not detected",
+                case.name, case.expected_rule_id
+            );
         }
+    }
+    #[tokio::test]
+    async fn rules_endpoint_reports_detector_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let request = Request::get("/rules").body(Body::empty())?;
+
+        let response = app().oneshot(request).await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 4096).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+        assert_eq!(json["detector_version"], "0.1.0");
+        assert_eq!(json["enabled_rules"].as_array().map(Vec::len), Some(3));
+        assert_eq!(json["enabled_rules"][0]["code"], "AIS001");
+        assert_eq!(json["enabled_rules"][1]["code"], "AIS002");
+        assert_eq!(json["enabled_rules"][2]["code"], "AIS003");
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -485,6 +539,7 @@ mod tests {
         Uuid::parse_str(request_id)?;
 
         assert_eq!(json["action"], "allow");
+        assert_eq!(json["detector_version"], "0.1.0");
 
         Ok(())
     }
