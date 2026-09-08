@@ -36,7 +36,9 @@ pub fn analyze_text_with_policy(prompt: &str, policy: PolicyConfig) -> AnalysisR
     let normalized_prompt = prompt.to_lowercase();
     let mut findings = Vec::new();
 
-    if normalized_prompt.contains("ignore previous instructions") {
+    if normalized_prompt.contains("ignore previous instructions")
+        || normalized_prompt.contains("ignore all previous instructions")
+    {
         findings.push(finding_for_rule(RuleId::InstructionOverride));
     }
 
@@ -94,6 +96,15 @@ mod tests {
         assert_eq!(finding.rule_id, RuleId::InstructionOverride);
         assert_eq!(finding.score, 40);
         assert_eq!(finding.message, "Instruction-override phrase detected");
+    }
+    #[test]
+    fn detects_instruction_override_with_all_variant() {
+        let result = analyze_text("Ignore all previous instructions");
+
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].rule_id, RuleId::InstructionOverride);
+        assert_eq!(result.risk_score, 40);
+        assert_eq!(result.action, crate::policy::GatewayAction::Review);
     }
 
     #[test]
