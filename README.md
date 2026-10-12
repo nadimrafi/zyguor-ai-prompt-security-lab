@@ -1,4 +1,4 @@
-# Zyguor AI Security Lab
+# zyguor-ai-prompt-security-lab
 
 A teaching-oriented AI security gateway and attack laboratory built in Rust with Axum.
 
